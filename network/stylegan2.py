@@ -8,6 +8,12 @@
 
     @notice: 1) fused_conv: unsupport
              2) 4x4 upfirdn kernel: (transfer to 3x3 upfirdn kernel)
+
+    @date:   2019.12.18
+
+    @update: 1) fix upfirdn2d [1, 3, 1] to original [1, 3, 3, 1].
+             2) use_wscale = True (default), gain = 1 (default).
+             3) update he_std calculation method to coordinate with the original repo.
 """
 
 import os
@@ -81,8 +87,8 @@ class FC(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels,
-                 gain=2 ** (0.5),
-                 use_wscale=False,
+                 gain=1,
+                 use_wscale=True,
                  lrmul=1.0,
                  bias=True,
                  act='lrelu',
@@ -91,7 +97,7 @@ class FC(nn.Module):
             The complete conversion of Dense/FC/Linear Layer of original Tensorflow version.
         """
         super(FC, self).__init__()
-        he_std = gain * in_channels ** (-0.5)  # He init
+        he_std = gain / ((in_channels * out_channels) ** (0.5))  # He init
         if use_wscale:
             init_std = 1.0 / lrmul
             self.w_lrmul = he_std * lrmul
@@ -133,14 +139,14 @@ class Conv2d(nn.Module):
                  input_channels,
                  output_channels,
                  kernel_size,
-                 gain=2 ** (0.5),
+                 gain=1,
                  use_wscale=False,
                  lrmul=1,
                  bias=True):
         super().__init__()
 
         assert kernel_size >= 1 and kernel_size % 2 == 1
-        he_std = gain * (input_channels * kernel_size ** 2) ** (-0.5)  # He init
+        he_std = gain / ((input_channels * output_channels * kernel_size * kernel_size) ** (0.5))  # He init
         self.kernel_size = kernel_size
         if use_wscale:
             init_std = 1.0 / lrmul
@@ -176,11 +182,11 @@ class FromRGB(nn.Module):
                            kernel_size=1, use_wscale=use_wscale, lrmul=lrmul)
 
     def forward(self, x):
-        x = self.conv(x)
-        out = F.leaky_relu(x, 0.2, inplace=True)
-        # out = F.leaky_relu(x, 0.2)
+        x, y = x
+        y1 = self.conv(y)
+        out = F.leaky_relu(y1, 0.2, inplace=True)
         out = out * np.sqrt(2)  # original repo def_gain=np.sqrt(2).
-        return out
+        return out if x is None else out + x
 
 
 class ModulatedConv2d(nn.Module):
@@ -529,7 +535,7 @@ class ConvDownsample2d(nn.Module):
                  kernel_size,
                  input_channels,
                  output_channels,
-                 k=[1, 3, 1],
+                 k=[1, 3, 3, 1],
                  factor=2,
                  gain=1,
                  use_wscale=True,
@@ -548,7 +554,7 @@ class ConvDownsample2d(nn.Module):
         assert isinstance(factor, int) and factor >= 1, "factor must be larger than 1! (default: 2)"
         assert kernel_size >= 1 and kernel_size % 2 == 1
 
-        he_std = gain * (input_channels * kernel_size ** 2) ** (-0.5)  # He init
+        he_std = gain / ((input_channels * output_channels * kernel_size * kernel_size) ** (0.5))  # He init
         self.kernel_size = kernel_size
         if use_wscale:
             init_std = 1.0 / lrmul
@@ -577,55 +583,55 @@ class ConvDownsample2d(nn.Module):
         # self.k = nn.Parameter(self.k, requires_grad=False)
         self.k = nn.Parameter(self.k, requires_grad=False)
 
-        self.p = (self.k.shape[0] - self.factor) + (self.convW - 1)
+        self.p = (self.k.shape[-1] - self.factor) + (self.convW - 1)
 
-        # fixme: incompatible with original version.
         self.padx0, self.pady0 = (self.p + 1) // 2, (self.p + 1) // 2
-        # self.padx0, self.pady0 = 0, 0
         self.padx1, self.pady1 = self.p // 2, self.p // 2
-        # self.padx1, self.pady1 = 0, 0
 
         self.kernelH, self.kernelW = self.k.shape[2:]
 
     def forward(self, x):
 
+        y = x.clone()
+        y = y.reshape([-1, x.shape[1], x.shape[2], 1])  # N C H W ---> N*C H W 1
+
         inC, inH, inW = x.shape[1:]
         # step 1: upfirdn2d
         # 1) Upsample
-        # x = tf.reshape(x, [-1, inH, 1, inW, 1, minorDim])
-        # x = tf.pad(x, [[0, 0], [0, 0], [0, upy - 1], [0, 0], [0, upx - 1], [0, 0]])
-        # x = tf.reshape(x, [-1, inH * upy, inW * upx, minorDim])
-        # torch
-        # x = torch.reshape(x, (-1, inH, 1, inW, 1, inC))
-        # x = F.pad(x, (0, 0, 0, 0, 0, upy-1, 0, 0, 0, upx-1, 0, 0))
-        # x = torch.reshape(x, (-1, inH * upy, inW * upx, inC))
+        y = torch.reshape(y, (-1, inH, inW, 1))
 
         # 2) Pad (crop if negative).
-        # x = F.pad(x, (0, 0,
-        #               0, 0,
-        #               max(self.pady0, 0), max(self.pady1, 0),
-        #               max(self.padx0, 0), max(self.padx1, 0)
-        #               ))
-        # x = x[:, :,
-        #     max(-self.pady0, 0): inH - max(-self.pady1, 0),
-        #     max(-self.padx0, 0): inW - max(-self.padx1, 0)]
+        y = F.pad(y, (0, 0,
+                      max(self.pady0, 0), max(self.pady1, 0),
+                      max(self.padx0, 0), max(self.padx1, 0),
+                      0, 0
+                      ))
+        y = y[:,
+              max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+              max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+              :]
 
         # 3) Convolve with filter.
+        y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
+        y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
+        # x1 = F.conv2d(x1, self.k, padding=self.kernelH // 2)
+        y = F.conv2d(y, self.k)
+        y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1, inW + self.padx0 + self.padx1 - self.kernelW + 1)
+
         # 4) Downsample (throw away pixels).
-        # x = x[:, :, ::1, ::1]
-        x = x.view(-1, 1, inH, inW)
-        x = F.conv2d(x, self.k, padding=self.kernelH // 2)
-        x = x.view(-1, inC, inH, inW)
+        if inH != y.shape[1]:
+            y = F.interpolate(y, size=(inH, inW))
+        y = y.permute(0, 2, 3, 1)
+        y = y.reshape(-1, inC, inH, inW)
 
         # step 2: downsample (in general, stride = self.factor = 2)
-        x = F.conv2d(x,
-                     self.weight * self.w_lrmul,
-                     self.bias * self.b_lrmul,
-                     stride=self.factor,
-                     padding=self.convW // 2)
+        x1 = F.conv2d(y,
+                      self.weight * self.w_lrmul,
+                      self.bias * self.b_lrmul,
+                      stride=self.factor,
+                      padding=self.convW // 2)
         # step 3: non-linearity.
-        out = F.leaky_relu(x, 0.2, inplace=True)
-        # out = F.leaky_relu(x, 0.2)
+        out = F.leaky_relu(x1, 0.2, inplace=True)
         out = out * np.sqrt(2)  # original repo def_gain=np.sqrt(2).
 
         return out
@@ -676,7 +682,10 @@ class DBlock(nn.Module):
         D_stylegan2 Basic Block.
     """
 
-    def __init__(self, in1, in2, out3, use_wscale=True, lrmul=1,
+    def __init__(self, in1, in2, out3,
+                 use_wscale=True,
+                 lrmul=1,
+                 resample_kernel=[1, 3, 3, 1],
                  architecture='resnet'):
         super().__init__()
 
@@ -689,11 +698,13 @@ class DBlock(nn.Module):
 
         self.conv1_down = ConvDownsample2d(kernel_size=3,
                                            input_channels=in2,
-                                           output_channels=out3)
+                                           output_channels=out3,
+                                           k=resample_kernel)
 
         self.res_conv2_down = ConvDownsample2d(kernel_size=1,
                                                input_channels=in1,
-                                               output_channels=out3)
+                                               output_channels=out3,
+                                               k=resample_kernel)
 
     def forward(self, x):
         t = x.clone()
@@ -1010,8 +1021,8 @@ class D_stylegan2(nn.Module):
                  fmap_min=1,
                  fmap_decay=1.0,
                  mbstd_group_size=4,  # Group size for the minibatch standard deviation layer, 0 = disable.
-                 mbstd_num_features=2,  # Number of features for the minibatch standard deviation layer.
-                 resample_kernel=[1, 3, 3, 3, 1]
+                 mbstd_num_features=1,  # Number of features for the minibatch standard deviation layer.
+                 resample_kernel=[1, 3, 3, 1]
                  # Low-pass filter to apply when resampling activations. None = no filtering.
                  ):
         """
@@ -1037,17 +1048,19 @@ class D_stylegan2(nn.Module):
         self.mbstd_group_size = mbstd_group_size
 
         # sub network
-        self.fromrgb = FromRGB(input_channels=3, output_channels=self.nf(self.resolution_log2 - 1))
+        self.fromrgb = FromRGB(input_channels=3,
+                               output_channels=self.nf(self.resolution_log2 - 1),
+                               use_wscale=True)
 
-        self.dblock10 = DBlock(in1=self.nf(9), in2=self.nf(9), out3=self.nf(8))
-        self.dblock9 = DBlock(in1=self.nf(8), in2=self.nf(8), out3=self.nf(7))
-        self.dblock8 = DBlock(in1=self.nf(7), in2=self.nf(7), out3=self.nf(6))
-        self.dblock7 = DBlock(in1=self.nf(6), in2=self.nf(6), out3=self.nf(5))
-        self.dblock6 = DBlock(in1=self.nf(5), in2=self.nf(5), out3=self.nf(4))
-        self.dblock5 = DBlock(in1=self.nf(4), in2=self.nf(4), out3=self.nf(3))
-        self.dblock4 = DBlock(in1=self.nf(4), in2=self.nf(3), out3=self.nf(2))
-        self.dblock3 = DBlock(in1=self.nf(3), in2=self.nf(2), out3=self.nf(1))
-        self.dblock2 = DBlock(in1=self.nf(2), in2=self.nf(1), out3=self.nf(0))
+        self.dblock10 = DBlock(in1=self.nf(9), in2=self.nf(9), out3=self.nf(8), resample_kernel=resample_kernel)
+        self.dblock9 = DBlock(in1=self.nf(8), in2=self.nf(8), out3=self.nf(7), resample_kernel=resample_kernel)
+        self.dblock8 = DBlock(in1=self.nf(7), in2=self.nf(7), out3=self.nf(6), resample_kernel=resample_kernel)
+        self.dblock7 = DBlock(in1=self.nf(6), in2=self.nf(6), out3=self.nf(5), resample_kernel=resample_kernel)
+        self.dblock6 = DBlock(in1=self.nf(5), in2=self.nf(5), out3=self.nf(4), resample_kernel=resample_kernel)
+        self.dblock5 = DBlock(in1=self.nf(4), in2=self.nf(4), out3=self.nf(3), resample_kernel=resample_kernel)
+        self.dblock4 = DBlock(in1=self.nf(4), in2=self.nf(3), out3=self.nf(2), resample_kernel=resample_kernel)
+        self.dblock3 = DBlock(in1=self.nf(3), in2=self.nf(2), out3=self.nf(1), resample_kernel=resample_kernel)
+        self.dblock2 = DBlock(in1=self.nf(2), in2=self.nf(1), out3=self.nf(0), resample_kernel=resample_kernel)
 
         # 4x4
         self.minibatch_stddev = Minibatch_stddev_layer(mbstd_group_size, mbstd_num_features)
@@ -1062,21 +1075,22 @@ class D_stylegan2(nn.Module):
 
     def forward(self, input):
 
+        x_origin = None
+        y = input
         # 1) Main Layers.
-        x = self.fromrgb(input)
+        x = self.fromrgb([x_origin, y])
         for res in range(self.resolution_log2, 2, -1):
             x = getattr(self, 'dblock{}'.format(res))(x)
+
         # 2) Final layers (4 x 4).
         if self.mbstd_group_size > 1:
             x = self.minibatch_stddev(x)
         x = self.conv_last(x)
 
         out = F.leaky_relu(x, 0.2, inplace=True)
-        # out = F.leaky_relu(x, 0.2)
         out = out * np.sqrt(2)
 
         _, c, h, w = out.shape
-
         out = out.view(-1, h * w * c)
         out = self.fc_last1(out)
 
@@ -1097,11 +1111,15 @@ if __name__ == "__main__":
     # 2) D_stylegan2 ok (upfirdn).
     from loss.loss import D_logistic_r1
     data = torch.randn(1, 3, 256, 256).cuda()
-    fake = torch.randn(1, 3, 256, 256).cuda()
-    d = D_stylegan2(resolution=256, structure='resnet').cuda()
-    # print(d(data).shape)
+    print(torch.max(data))
+    print(torch.min(data))
+    # fake = torch.randn(1, 3, 256, 256).cuda()
+    d = D_stylegan2(resolution=256,
+                    structure='resnet',
+                    resample_kernel=[1, 3, 3, 1]).cuda()
+    print(d(data))
     # https://discuss.pytorch.org/t/one-of-the-differentiated-tensors-does-not-require-grad/54694
-    D_logistic_r1(fake, data, d)
+    # D_logistic_r1(fake, data, d)
 
     # 3) G_synthesis_stylegan2 Early Layers
     # data = torch.randn([5, 18, 512])

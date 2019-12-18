@@ -18,3 +18,7 @@ def _setup_kernel(k):
     return k
 
 
+if __name__ == "__main__":
+    k = _setup_kernel([1, 3, 3, 1])
+    print(k)
+    print(k[::-1, ::-1])

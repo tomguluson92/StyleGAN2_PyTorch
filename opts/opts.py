@@ -32,12 +32,10 @@ class TrainOptions():
         parser.add_argument('--fmap_base', type=int, default=8 << 10)
         parser.add_argument('--resolution', type=int, default=128)
         parser.add_argument('--mapping_layers', type=int, default=8)
-        parser.add_argument('--batch_size', type=int, default=4)
+        parser.add_argument('--batch_size', type=int, default=8)
         parser.add_argument('--type', type=str, default='style')
         parser.add_argument('--resume', type=str, default='train_result/models/latest.pth')
         parser.add_argument('--det', type=str, default='train_result')
-        parser.add_argument('--r1_gamma', type=float, default=10.0)
-        parser.add_argument('--r2_gamma', type=float, default=0.0)
         self.opts = parser.parse_args()
 
     def parse(self):

@@ -25,11 +25,11 @@ import os
 
 
 # Set random seem for reproducibility
-manualSeed = 999
+# manualSeed = 999
 #manualSeed = random.randint(1, 10000) # use if you want new results
-print("Random Seed: ", manualSeed)
-random.seed(manualSeed)
-torch.manual_seed(manualSeed)
+# print("Random Seed: ", manualSeed)
+# random.seed(manualSeed)
+# torch.manual_seed(manualSeed)
 
 # Hyper-parameters
 CRITIC_ITER = 3
@@ -82,8 +82,8 @@ def main(opts):
     D.to(opts.device)
 
     # Create the criterion, optimizer and scheduler
-    optim_D = optim.Adam(D.parameters(), lr=1e-4, betas=(0.9, 0.999))
-    optim_G = optim.Adam(G.parameters(), lr=1e-4, betas=(0.9, 0.999))
+    optim_D = optim.Adam(D.parameters(), lr=0.001, betas=(0.9, 0.999))
+    optim_G = optim.Adam(G.parameters(), lr=0.001, betas=(0.9, 0.999))
     scheduler_D = optim.lr_scheduler.ExponentialLR(optim_D, gamma=0.99)
     scheduler_G = optim.lr_scheduler.ExponentialLR(optim_G, gamma=0.99)
 
@@ -97,14 +97,16 @@ def main(opts):
         loss_D_list = []
         loss_G_list = []
         for i, (real_img,) in enumerate(bar):
+
+            real_img = real_img.to(opts.device)
+            latents = torch.randn([real_img.size(0), 512]).to(opts.device)
+
             # =======================================================================================================
             #   (1) Update D network: D_logistic_r1(default)
             # =======================================================================================================
             # Compute adversarial loss toward discriminator
-            D.zero_grad()
             real_img = real_img.to(opts.device)
             real_logit = D(real_img)
-            latents = torch.randn([real_img.size(0), 512]).to(opts.device)
             fake_img, fake_dlatent = G(latents)
             fake_logit = D(fake_img.detach())
 
@@ -120,37 +122,36 @@ def main(opts):
             loss_D_list.append(d_loss.mean().item())
 
             # Update discriminator
+            optim_D.zero_grad()
             d_loss.backward()
             optim_D.step()
 
             # =======================================================================================================
             #   (2) Update G network: G_logistic_ns_pathreg(default)
             # =======================================================================================================
-            if i % CRITIC_ITER == 0:
-                G.zero_grad()
-                fake_img, fake_dlatent = G(latents)
-                fake_scores_out = D(fake_img)
-                _g_loss = softplus(-fake_scores_out)
+            # if i % CRITIC_ITER == 0:
+            G.zero_grad()
+            fake_scores_out = D(fake_img)
+            _g_loss = softplus(-fake_scores_out)
 
-                # Compute |J*y|.
-                pl_noise = torch.randn(fake_img.shape) / np.sqrt(fake_img.shape[2] * fake_img.shape[3])
-                pl_noise = pl_noise.to(fake_img.device)
-                pl_grads = grad(torch.sum(fake_img * pl_noise), fake_dlatent, retain_graph=True)[0]
-                pl_lengths = torch.sqrt(torch.sum(torch.sum(torch.mul(pl_grads, pl_grads), dim=2), dim=1))
-                pl_mean = PL_DECAY * torch.sum(pl_lengths)
+            # Compute |J*y|.
+            # pl_noise = (torch.randn(fake_img.shape) / np.sqrt(fake_img.shape[2] * fake_img.shape[3])).to(fake_img.device)
+            # pl_grads = grad(torch.sum(fake_img * pl_noise), fake_dlatent, retain_graph=True)[0]
+            # pl_lengths = torch.sqrt(torch.sum(torch.sum(torch.mul(pl_grads, pl_grads), dim=2), dim=1))
+            # pl_mean = PL_DECAY * torch.sum(pl_lengths)
+            #
+            # pl_penalty = torch.mul(pl_lengths - pl_mean, pl_lengths - pl_mean)
+            # reg = pl_penalty * PL_WEIGHT
+            #
+            # # original
+            # g_loss = (_g_loss + reg).mean()
+            # lite
+            g_loss = _g_loss.mean()
+            loss_G_list.append(g_loss.mean().item())
 
-                pl_penalty = torch.mul(pl_lengths - pl_mean, pl_lengths - pl_mean)
-                reg = pl_penalty * PL_WEIGHT
-
-                # original
-                g_loss = (_g_loss + reg).mean()
-                # lite
-                # g_loss = _g_loss.mean()
-                loss_G_list.append(g_loss.mean().item())
-
-                # Update generator
-                g_loss.backward(retain_graph=True)
-                optim_G.step()
+            # Update generator
+            g_loss.backward(retain_graph=True)
+            optim_G.step()
 
             # Output training stats
             bar.set_description(
