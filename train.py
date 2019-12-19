@@ -50,6 +50,7 @@ def main(opts):
         ])),
         batch_size=opts.batch_size,
         shuffle=True,
+        drop_last=True
     )
 
     # Create the model
@@ -82,8 +83,13 @@ def main(opts):
     D.to(opts.device)
 
     # Create the criterion, optimizer and scheduler
-    optim_D = optim.Adam(D.parameters(), lr=0.001, betas=(0.9, 0.999))
-    optim_G = optim.Adam(G.parameters(), lr=0.001, betas=(0.9, 0.999))
+    lr_D = 0.0015
+    lr_G = 0.0015
+    optim_D = torch.optim.Adam(D.parameters(), lr=lr_D, betas=(0.9, 0.999))
+    # g_mapping has 100x lower learning rate
+    params_G = [{"params": G.g_synthesis.parameters()},
+				{"params": G.g_mapping.parameters(), "lr": lr_G * 0.01}]
+    optim_G = torch.optim.Adam(params_G, lr=lr_G, betas=(0.9, 0.999))
     scheduler_D = optim.lr_scheduler.ExponentialLR(optim_D, gamma=0.99)
     scheduler_G = optim.lr_scheduler.ExponentialLR(optim_G, gamma=0.99)
 
