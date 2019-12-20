@@ -14,7 +14,11 @@
     @update: 1) fix upfirdn2d [1, 3, 1] to original [1, 3, 3, 1] in D_stylegan2 and Upsample2d.
              2) use_wscale = True (default), gain = 1 (default).
              3) update he_std calculation method to coordinate with the original repo.
-             4)
+
+
+    @date:   2019.12.20
+
+    @update: 1) split ModulatedConv2d into 2 part.
 """
 
 import os
@@ -26,7 +30,6 @@ from collections import OrderedDict
 
 from utils.libs import _setup_kernel, _approximate_size
 from opts.opts import TrainOptions
-
 
 
 # =========================================================================
@@ -239,7 +242,19 @@ class ModulatedConv2d(nn.Module):
 
         self.dense = FC(dlatent_size, input_channels, gain, lrmul=lrmul, use_wscale=use_wscale, mode='modulate')
 
-        self.upsample = UpConvsample2d(kernel_size=kernel_size, k=k, opts=opts)
+        if self.up:
+            factor = 2
+            self.k = _setup_kernel(k) * (gain * (factor ** 2))  # 4 x 4
+            self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
+            # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
+            self.k = nn.Parameter(self.k, requires_grad=False).to(opts.device)
+
+            self.p = self.k.shape[0] - factor - (kernel_size - 1)
+
+            self.padx0, self.pady0 = (self.p + 1) // 2 + factor - 1, (self.p + 1) // 2 + factor - 1
+            self.padx1, self.pady1 = self.p // 2 + 1, self.p // 2 + 1
+
+            self.kernelH, self.kernelW = self.k.shape[2:]
 
     def forward(self, x):
         x, y = x
@@ -256,26 +271,64 @@ class ModulatedConv2d(nn.Module):
         self.ww = self.w.unsqueeze(0)
         self.ww = self.ww.repeat(s.shape[0], 1, 1, 1, 1)
         self.ww = self.ww.permute(0, 3, 4, 1, 2)
-        self.ww = self.ww * s.unsqueeze(1).unsqueeze(1).unsqueeze(1).to(self.opts.device)  # [BkkOI] Scale input feature maps.
-        self.ww = self.ww.permute(0, 1, 2, 4, 3)    # [BkkIO]
+        self.ww = self.ww * s.unsqueeze(1).unsqueeze(1).unsqueeze(1).to(
+            self.opts.device)  # [BkkOI] Scale input feature maps.
+        self.ww = self.ww.permute(0, 1, 2, 4, 3)  # [BkkIO]
 
         # Demodulate.
         if self.demodulate:
             d = torch.mul(self.ww, self.ww)
-            d = torch.rsqrt(torch.mean(d, dim=[1, 2, 3]) + 1e-8)                # [BO] Scaling factor.
-            self.ww = self.ww * d.unsqueeze(1).unsqueeze(1).unsqueeze(1)        # [BkkIO] Scale output feature maps.
+            d = torch.rsqrt(torch.mean(d, dim=[1, 2, 3]) + 1e-8)  # [BO] Scaling factor.
+            self.ww = self.ww * d.unsqueeze(1).unsqueeze(1).unsqueeze(1)  # [BkkIO] Scale output feature maps.
 
         # Reshape/scale input.
         if self.fused_modconv:
-            x = x.view(1, -1, x.shape[2], x.shape[3])                           # Fused => reshape minibatch to convolution groups.
-            self.w_new = torch.reshape(self.ww.permute(0, 4, 3, 1, 2), (-1, x.shape[1], self.ww.shape[1], self.ww.shape[2]))
+            x = x.view(1, -1, x.shape[2], x.shape[3])  # Fused => reshape minibatch to convolution groups.
+            self.w_new = torch.reshape(self.ww.permute(0, 4, 3, 1, 2),
+                                       (-1, x.shape[1], self.ww.shape[1], self.ww.shape[2]))
         else:
-            x = x * s.unsqueeze(-1).unsqueeze(-1).to(self.opts.device)          # [BIhw] Not fused => scale input activations.
+            x = x * s.unsqueeze(-1).unsqueeze(-1).to(self.opts.device)  # [BIhw] Not fused => scale input activations.
             self.w_new = self.w.unsqueeze(0).repeat(s.shape[0], 1, 1, 1, 1)
 
         # Convolution with optional up/downsampling.
         if self.up:
-            x = self.upsample([x, self.w_new])
+            inC, outC, convH, convW = self.w_new.shape[0], self.w_new.shape[1], self.w_new.shape[2], self.w_new.shape[3]
+            self.w_new = self.w_new.reshape(outC, inC, convH, convW)
+            x = F.conv_transpose2d(x, self.w_new, stride=2)
+
+            # step 2: upfirdn2d
+            y = x.clone()
+            y = y.reshape([-1, x.shape[2], x.shape[3], 1])  # N C H W ---> N*C H W 1
+
+            inC, inH, inW = x.shape[1:]
+            # 1) Upsample
+            y = torch.reshape(y, (-1, inH, inW, 1))
+
+            # 2) Pad (crop if negative).
+            y = F.pad(y, (0, 0,
+                          max(self.pady0, 0), max(self.pady1, 0),
+                          max(self.padx0, 0), max(self.padx1, 0),
+                          0, 0
+                          ))
+            y = y[:,
+                  max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+                  max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+                  :]
+
+            # 3) Convolve with filter.
+            y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
+            y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
+            y = F.conv2d(y, self.k)
+            y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
+                       inW + self.padx0 + self.padx1 - self.kernelW + 1)
+
+            # 4) Downsample (throw away pixels).
+            if inH != y.shape[1] or inH % 2 != 0:
+                inH = inW = _approximate_size(inH)
+                y = F.interpolate(y, size=(inH, inW))
+            y = y.permute(0, 2, 3, 1)
+            x = y.reshape(-1, inC, inH, inW)
+
         elif self.down:
             pass
         else:
@@ -284,9 +337,9 @@ class ModulatedConv2d(nn.Module):
                          padding=self.w_new.shape[2] // 2)
         # Reshape/scale output.
         if self.fused_modconv:
-            x = x.view(-1, self.fmaps, x.shape[2], x.shape[3])                 # Fused => reshape convolution groups back to minibatch.
+            x = x.view(-1, self.fmaps, x.shape[2], x.shape[3])  # Fused => reshape convolution groups back to minibatch.
         elif self.demodulate:
-            x = x * d.unsqueeze(1).unsqueeze(1)                                # [BOhw] Not fused => scale output activations.
+            x = x * d.unsqueeze(1).unsqueeze(1)  # [BOhw] Not fused => scale output activations.
 
         return x
 
@@ -426,7 +479,6 @@ class Upsample2d(nn.Module):
         self.down = down
 
     def forward(self, x):
-
         y = x.clone()
         y = y.reshape([-1, x.shape[2], x.shape[3], 1])  # N C H W ---> N*C H W 1
 
@@ -445,9 +497,9 @@ class Upsample2d(nn.Module):
                       0, 0
                       ))
         y = y[:,
-              max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
-              max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
-              :]
+            max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+            max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+            :]
         # 3) Convolve with filter.
 
         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
@@ -466,90 +518,91 @@ class Upsample2d(nn.Module):
         return y
 
 
-class UpConvsample2d(nn.Module):
-    """
-        @date: 2019.12.19
-        @update: revise UpConvsample2d to coord with the original tf version.
-    """
-    def __init__(self,
-                 opts,
-                 kernel_size=3,
-                 k=[1, 3, 3, 1],
-                 factor=2,
-                 gain=1,
-                 down=1,
-                 use_wscale=True,
-                 lrmul=1,
-                 bias=True):
-        """
-            UpConvsample2D method in G_synthesis_stylegan2.
-        :param k: FIR filter of the shape `[firH, firW]` or `[firN]` (separable).
-                  The default is `[1] * factor`, which corresponds to average pooling.
-        :param factor: Integer downsampling factor (default: 2).
-        :param gain:   Scaling factor for signal magnitude (default: 1.0).
-
-            Returns: Tensor of the shape `[N, C, H * factor, W * factor]`
-        """
-        super().__init__()
-        assert isinstance(factor, int) and factor >= 1, "factor must be larger than 1! (default: 2)"
-
-        self.gain = gain
-        self.factor = factor
-
-        self.k = _setup_kernel(k) * (self.gain * (factor ** 2))  # 4 x 4
-        self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
-        # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
-        self.k = nn.Parameter(self.k, requires_grad=False).to(opts.device)
-
-        self.p = self.k.shape[0] - self.factor - (kernel_size - 1)
-
-        self.padx0, self.pady0 = (self.p + 1) // 2 + factor - 1, (self.p + 1) // 2 + factor - 1
-        self.padx1, self.pady1 = self.p // 2 + 1, self.p // 2 + 1
-
-        self.kernelH, self.kernelW = self.k.shape[2:]
-        self.down = down
-
-    def forward(self, x):
-        x, w = x
-        inC, outC, convH, convW = w.shape[0], w.shape[1], w.shape[2], w.shape[3]
-
-        w = w.reshape(outC, inC, convH, convW)
-        x = F.conv_transpose2d(x, w, stride=self.factor)
-
-        # step 2: upfirdn2d
-        y = x.clone()
-        y = y.reshape([-1, x.shape[2], x.shape[3], 1])  # N C H W ---> N*C H W 1
-
-        inC, inH, inW = x.shape[1:]
-        # 1) Upsample
-        y = torch.reshape(y, (-1, inH, inW, 1))
-
-        # 2) Pad (crop if negative).
-        y = F.pad(y, (0, 0,
-                      max(self.pady0, 0), max(self.pady1, 0),
-                      max(self.padx0, 0), max(self.padx1, 0),
-                      0, 0
-                      ))
-        y = y[:,
-              max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
-              max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
-              :]
-
-        # 3) Convolve with filter.
-        y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
-        y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
-        y = F.conv2d(y, self.k)
-        y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
-                   inW + self.padx0 + self.padx1 - self.kernelW + 1)
-
-        # 4) Downsample (throw away pixels).
-        if inH != y.shape[1] or inH % 2 != 0:
-            inH = inW = _approximate_size(inH)
-            y = F.interpolate(y, size=(inH, inW))
-        y = y.permute(0, 2, 3, 1)
-        y = y.reshape(-1, inC, inH, inW)
-
-        return y
+# class UpConvsample2d(nn.Module):
+#     """
+#         @date: 2019.12.19
+#         @update: revise UpConvsample2d to coord with the original tf version.
+#     """
+#
+#     def __init__(self,
+#                  opts,
+#                  kernel_size=3,
+#                  k=[1, 3, 3, 1],
+#                  factor=2,
+#                  gain=1,
+#                  down=1,
+#                  use_wscale=True,
+#                  lrmul=1,
+#                  bias=True):
+#         """
+#             UpConvsample2D method in G_synthesis_stylegan2.
+#         :param k: FIR filter of the shape `[firH, firW]` or `[firN]` (separable).
+#                   The default is `[1] * factor`, which corresponds to average pooling.
+#         :param factor: Integer downsampling factor (default: 2).
+#         :param gain:   Scaling factor for signal magnitude (default: 1.0).
+#
+#             Returns: Tensor of the shape `[N, C, H * factor, W * factor]`
+#         """
+#         super().__init__()
+#         assert isinstance(factor, int) and factor >= 1, "factor must be larger than 1! (default: 2)"
+#
+#         self.gain = gain
+#         self.factor = factor
+#
+#         self.k = _setup_kernel(k) * (self.gain * (factor ** 2))  # 4 x 4
+#         self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
+#         # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
+#         self.k = nn.Parameter(self.k, requires_grad=False).to(opts.device)
+#
+#         self.p = self.k.shape[0] - self.factor - (kernel_size - 1)
+#
+#         self.padx0, self.pady0 = (self.p + 1) // 2 + factor - 1, (self.p + 1) // 2 + factor - 1
+#         self.padx1, self.pady1 = self.p // 2 + 1, self.p // 2 + 1
+#
+#         self.kernelH, self.kernelW = self.k.shape[2:]
+#         self.down = down
+#
+#     def forward(self, x):
+#         x, w = x
+#         inC, outC, convH, convW = w.shape[0], w.shape[1], w.shape[2], w.shape[3]
+#
+#         w = w.reshape(outC, inC, convH, convW)
+#         x = F.conv_transpose2d(x, w, stride=self.factor)
+#
+#         # step 2: upfirdn2d
+#         y = x.clone()
+#         y = y.reshape([-1, x.shape[2], x.shape[3], 1])  # N C H W ---> N*C H W 1
+#
+#         inC, inH, inW = x.shape[1:]
+#         # 1) Upsample
+#         y = torch.reshape(y, (-1, inH, inW, 1))
+#
+#         # 2) Pad (crop if negative).
+#         y = F.pad(y, (0, 0,
+#                       max(self.pady0, 0), max(self.pady1, 0),
+#                       max(self.padx0, 0), max(self.padx1, 0),
+#                       0, 0
+#                       ))
+#         y = y[:,
+#             max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+#             max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+#             :]
+#
+#         # 3) Convolve with filter.
+#         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
+#         y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
+#         y = F.conv2d(y, self.k)
+#         y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
+#                    inW + self.padx0 + self.padx1 - self.kernelW + 1)
+#
+#         # 4) Downsample (throw away pixels).
+#         if inH != y.shape[1] or inH % 2 != 0:
+#             inH = inW = _approximate_size(inH)
+#             y = F.interpolate(y, size=(inH, inW))
+#         y = y.permute(0, 2, 3, 1)
+#         y = y.reshape(-1, inC, inH, inW)
+#
+#         return y
 
 
 class ConvDownsample2d(nn.Module):
@@ -961,6 +1014,9 @@ class G_synthesis_stylegan2(nn.Module):
         # upsample layer
         self.upsample2d = Upsample2d(opts=opts)
 
+        #
+        self.tanh = torch.nn.Tanh()
+
     def forward(self, dlatent):
         # Early Layers
         y = None
@@ -981,6 +1037,7 @@ class G_synthesis_stylegan2(nn.Module):
 
         # [-1, 1]
         # y = y / torch.max(torch.abs(y))
+        # y = self.tanh(y)
         return y
 
 
@@ -1005,7 +1062,7 @@ class G_stylegan2(nn.Module):
                  architecture='skip',  # Architecture: 'orig', 'skip'.
                  act='lrelu',  # Activation function: 'linear', 'lrelu'.
                  lrmul=0.01,  # Learning rate multiplier for the mapping layers.
-                 gain=1       # original gain in tensorflow.
+                 gain=1  # original gain in tensorflow.
                  ):
         super().__init__()
         assert architecture in ['orig', 'skip']
