@@ -19,6 +19,12 @@
     @date:   2019.12.20
 
     @update: 1) split ModulatedConv2d into 2 part.
+
+    @date:   2019.12.25
+
+    @update: 1) transpose weight in ModulatedConv2d.
+             2) add MSG style structure StyleGAN2.
+             3) refact G & D with torch.nn.ModuleList.
 """
 
 import os
@@ -26,10 +32,17 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 import torch
-from collections import OrderedDict
+from torch.nn import ModuleList
 
 from utils.libs import _setup_kernel, _approximate_size
-from opts.opts import TrainOptions
+from opts.opts import TrainOptions, INFO
+
+import copy
+from tqdm import tqdm
+
+from torchvision.utils import save_image
+from matplotlib import pyplot as plt
+from utils.utils import plotLossCurve
 
 
 # =========================================================================
@@ -246,6 +259,7 @@ class ModulatedConv2d(nn.Module):
             factor = 2
             self.k = _setup_kernel(k) * (gain * (factor ** 2))  # 4 x 4
             self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
+            self.k = torch.flip(self.k, [2, 3])
             # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
             self.k = nn.Parameter(self.k, requires_grad=False).to(opts.device)
 
@@ -311,13 +325,14 @@ class ModulatedConv2d(nn.Module):
                           0, 0
                           ))
             y = y[:,
-                  max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
-                  max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
-                  :]
+                max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+                max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+                :]
 
             # 3) Convolve with filter.
             y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
             y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
+            # self.k = torch.flip(self.k, [2, 3]).to(self.opts.device)
             y = F.conv2d(y, self.k)
             y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
                        inW + self.padx0 + self.padx1 - self.kernelW + 1)
@@ -468,6 +483,7 @@ class Upsample2d(nn.Module):
 
         self.k = _setup_kernel(k) * (self.gain * (factor ** 2))  # 4 x 4
         self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
+        self.k = torch.flip(self.k, [2, 3])
         self.k = nn.Parameter(self.k, requires_grad=False).to(self.opts.device)
 
         self.p = self.k.shape[0] - self.factor
@@ -504,6 +520,7 @@ class Upsample2d(nn.Module):
 
         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
         y = y.reshape(-1, 1, inH * self.factor + self.pady0 + self.pady1, inW * self.factor + self.padx0 + self.padx1)
+        # self.k = torch.flip(self.k, [2, 3]).to(self.opts.device)
         y = F.conv2d(y, self.k)
         y = y.view(-1, 1,
                    inH * self.factor + self.pady0 + self.pady1 - self.kernelH + 1,
@@ -516,93 +533,6 @@ class Upsample2d(nn.Module):
         y = y.reshape(-1, inC, inH * self.factor, inW * self.factor)
 
         return y
-
-
-# class UpConvsample2d(nn.Module):
-#     """
-#         @date: 2019.12.19
-#         @update: revise UpConvsample2d to coord with the original tf version.
-#     """
-#
-#     def __init__(self,
-#                  opts,
-#                  kernel_size=3,
-#                  k=[1, 3, 3, 1],
-#                  factor=2,
-#                  gain=1,
-#                  down=1,
-#                  use_wscale=True,
-#                  lrmul=1,
-#                  bias=True):
-#         """
-#             UpConvsample2D method in G_synthesis_stylegan2.
-#         :param k: FIR filter of the shape `[firH, firW]` or `[firN]` (separable).
-#                   The default is `[1] * factor`, which corresponds to average pooling.
-#         :param factor: Integer downsampling factor (default: 2).
-#         :param gain:   Scaling factor for signal magnitude (default: 1.0).
-#
-#             Returns: Tensor of the shape `[N, C, H * factor, W * factor]`
-#         """
-#         super().__init__()
-#         assert isinstance(factor, int) and factor >= 1, "factor must be larger than 1! (default: 2)"
-#
-#         self.gain = gain
-#         self.factor = factor
-#
-#         self.k = _setup_kernel(k) * (self.gain * (factor ** 2))  # 4 x 4
-#         self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
-#         # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
-#         self.k = nn.Parameter(self.k, requires_grad=False).to(opts.device)
-#
-#         self.p = self.k.shape[0] - self.factor - (kernel_size - 1)
-#
-#         self.padx0, self.pady0 = (self.p + 1) // 2 + factor - 1, (self.p + 1) // 2 + factor - 1
-#         self.padx1, self.pady1 = self.p // 2 + 1, self.p // 2 + 1
-#
-#         self.kernelH, self.kernelW = self.k.shape[2:]
-#         self.down = down
-#
-#     def forward(self, x):
-#         x, w = x
-#         inC, outC, convH, convW = w.shape[0], w.shape[1], w.shape[2], w.shape[3]
-#
-#         w = w.reshape(outC, inC, convH, convW)
-#         x = F.conv_transpose2d(x, w, stride=self.factor)
-#
-#         # step 2: upfirdn2d
-#         y = x.clone()
-#         y = y.reshape([-1, x.shape[2], x.shape[3], 1])  # N C H W ---> N*C H W 1
-#
-#         inC, inH, inW = x.shape[1:]
-#         # 1) Upsample
-#         y = torch.reshape(y, (-1, inH, inW, 1))
-#
-#         # 2) Pad (crop if negative).
-#         y = F.pad(y, (0, 0,
-#                       max(self.pady0, 0), max(self.pady1, 0),
-#                       max(self.padx0, 0), max(self.padx1, 0),
-#                       0, 0
-#                       ))
-#         y = y[:,
-#             max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
-#             max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
-#             :]
-#
-#         # 3) Convolve with filter.
-#         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
-#         y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
-#         y = F.conv2d(y, self.k)
-#         y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
-#                    inW + self.padx0 + self.padx1 - self.kernelW + 1)
-#
-#         # 4) Downsample (throw away pixels).
-#         if inH != y.shape[1] or inH % 2 != 0:
-#             inH = inW = _approximate_size(inH)
-#             y = F.interpolate(y, size=(inH, inW))
-#         y = y.permute(0, 2, 3, 1)
-#         y = y.reshape(-1, inC, inH, inW)
-#
-#         return y
 
 
 class ConvDownsample2d(nn.Module):
@@ -653,9 +583,8 @@ class ConvDownsample2d(nn.Module):
         self.factor = factor
 
         self.k = _setup_kernel(k) * self.gain  # 3 x 3. (original 4 x 4).
-        self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0).to('cuda')
-        # todo: must wrap self.k into nn.Parameter, or the VRAM exceeds the limits.
-        # self.k = nn.Parameter(self.k, requires_grad=False)
+        self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
+        self.k = torch.flip(self.k, [2, 3]).to("cuda")
         self.k = nn.Parameter(self.k, requires_grad=False)
 
         self.p = (self.k.shape[-1] - self.factor) + (self.convW - 1)
@@ -690,6 +619,8 @@ class ConvDownsample2d(nn.Module):
         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
         y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
         # x1 = F.conv2d(x1, self.k, padding=self.kernelH // 2)
+
+        # self.k = torch.flip(self.k, [2, 3]).to("cuda")
         y = F.conv2d(y, self.k)
         y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
                    inW + self.padx0 + self.padx1 - self.kernelW + 1)
@@ -854,13 +785,9 @@ class G_mapping(nn.Module):
         self.mapping_layers = mapping_layers
 
         self.fc1 = FC(self.mapping_fmaps, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc2 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc3 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc4 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc5 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc6 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc7 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
-        self.fc8 = FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale)
+        self.fc_layers = ModuleList([])
+        for _ in range(2, mapping_layers + 1):
+            self.fc_layers.append(FC(dlatent_size, dlatent_size, gain=gain, lrmul=lrmul, use_wscale=use_wscale))
 
         self.normalize_latents = normalize_latents
         self.resolution_log2 = int(np.log2(resolution))
@@ -872,8 +799,8 @@ class G_mapping(nn.Module):
             x = self.pixel_norm(x)
 
         out = self.fc1(x)
-        for _ in range(2, self.mapping_layers + 1):
-            out = getattr(self, 'fc{}'.format(_))(out)
+        for fc in self.fc_layers:
+            out = fc(out)
 
         out = out.unsqueeze(1)
         out = out.repeat(1, self.num_layers, 1)
@@ -920,7 +847,9 @@ class G_synthesis_stylegan2(nn.Module):
         self.opts = opts
 
         # Primary inputs.
-        self.x = nn.Parameter(torch.randn(1, self.nf(1), 4, 4), requires_grad=False).to(self.opts.device)
+        self.x = nn.Parameter(torch.randn(1, self.nf(1), 4, 4)).to(self.opts.device)
+        self.y = None
+        # self.x = torch.randn(1, self.nf(1), 4, 4).to(self.opts.device)
 
         # layer0
         self.rgb0 = ToRGB(input_channels=self.nf(1),
@@ -936,90 +865,36 @@ class G_synthesis_stylegan2(nn.Module):
                               up=False,
                               opts=opts)
 
-        # rgb layer
-        self.rgb3 = ToRGB(input_channels=self.nf(3),
-                          output_channels=num_channels,
-                          res=3,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb4 = ToRGB(input_channels=self.nf(4),
-                          output_channels=num_channels,
-                          res=4,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb5 = ToRGB(input_channels=self.nf(5),
-                          output_channels=num_channels,
-                          res=5,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb6 = ToRGB(input_channels=self.nf(6),
-                          output_channels=num_channels,
-                          res=6,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb7 = ToRGB(input_channels=self.nf(7),
-                          output_channels=num_channels,
-                          res=7,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb8 = ToRGB(input_channels=self.nf(8),
-                          output_channels=num_channels,
-                          res=8,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb9 = ToRGB(input_channels=self.nf(9),
-                          output_channels=num_channels,
-                          res=9,
-                          opts=opts,
-                          fused_modconv=fused_modconv)
-        self.rgb10 = ToRGB(input_channels=self.nf(10),
-                           output_channels=num_channels,
-                           res=10,
-                           opts=opts,
-                           fused_modconv=fused_modconv)
+        # rgb layers & block layers.
+        self.rgb_layers = ModuleList([ToRGB(input_channels=self.nf(3),
+                                            output_channels=num_channels,
+                                            res=3,
+                                            opts=opts,
+                                            fused_modconv=fused_modconv)])
+        self.block_layers = ModuleList([GBlock(input_channels=self.nf(2),
+                                               output_channels=self.nf(3),
+                                               layer_idx=1,
+                                               opts=opts)])
 
-        # block layer
-        self.block3 = GBlock(input_channels=self.nf(2),
-                             output_channels=self.nf(3),
-                             layer_idx=1,
-                             opts=opts)
-        self.block4 = GBlock(input_channels=self.nf(3),
-                             output_channels=self.nf(4),
-                             layer_idx=3,
-                             opts=opts)
-        self.block5 = GBlock(input_channels=self.nf(4),
-                             output_channels=self.nf(5),
-                             layer_idx=5,
-                             opts=opts)
-        self.block6 = GBlock(input_channels=self.nf(5),
-                             output_channels=self.nf(6),
-                             layer_idx=7,
-                             opts=opts)
-        self.block7 = GBlock(input_channels=self.nf(6),
-                             output_channels=self.nf(7),
-                             layer_idx=9,
-                             opts=opts)
-        self.block8 = GBlock(input_channels=self.nf(7),
-                             output_channels=self.nf(8),
-                             layer_idx=11,
-                             opts=opts)
-        self.block9 = GBlock(input_channels=self.nf(8),
-                             output_channels=self.nf(9),
-                             layer_idx=13,
-                             opts=opts)
-        self.block10 = GBlock(input_channels=self.nf(9),
-                              output_channels=self.nf(10),
-                              layer_idx=15,
-                              opts=opts)
+        for res in range(4, self.resolution_log2 + 1):
+            self.rgb_layers.append(ToRGB(input_channels=self.nf(res),
+                                         output_channels=num_channels,
+                                         res=res,
+                                         opts=opts,
+                                         fused_modconv=fused_modconv))
+            self.block_layers.append(GBlock(input_channels=self.nf(res - 1),
+                                            output_channels=self.nf(res),
+                                            layer_idx=(res - 2) * 2 - 1,
+                                            opts=opts))
+
         # upsample layer
         self.upsample2d = Upsample2d(opts=opts)
 
-        #
-        self.tanh = torch.nn.Tanh()
+        # self.tanh = torch.nn.Tanh()
 
     def forward(self, dlatent):
         # Early Layers
-        y = None
+        y = self.y
         x = self.x.repeat(dlatent.shape[0], 1, 1, 1)
         x = self.glayer0([x, dlatent[:, 0]])
 
@@ -1028,12 +903,12 @@ class G_synthesis_stylegan2(nn.Module):
 
         # Main layers.
         # for res in range(3, self.resolution_log2 + 1):
-        for res in range(3, self.resolution_log2 + 1):
-            x = getattr(self, 'block{}'.format(res))([x, dlatent])
+        for res, (rgb, block) in enumerate(zip(self.rgb_layers, self.block_layers)):
+            x = block([x, dlatent])
             if self.arch == 'skip':
                 y = self.upsample2d(y)
-            if self.arch == 'skip' or res == self.resolution_log2:
-                y = getattr(self, 'rgb{}'.format(res))([x, y, dlatent])
+            if self.arch == 'skip' or (res + 3) == self.resolution_log2:
+                y = rgb([x, y, dlatent])
 
         # [-1, 1]
         # y = y / torch.max(torch.abs(y))
@@ -1062,12 +937,15 @@ class G_stylegan2(nn.Module):
                  architecture='skip',  # Architecture: 'orig', 'skip'.
                  act='lrelu',  # Activation function: 'linear', 'lrelu'.
                  lrmul=0.01,  # Learning rate multiplier for the mapping layers.
-                 gain=1  # original gain in tensorflow.
+                 gain=1,  # original gain in tensorflow.
+                 truncation_psi=0.7,  # Style strength multiplier for the truncation trick. None = disable.
+                 truncation_cutoff=8,  # Number of layers for which to apply the truncation trick. None = disable.
                  ):
         super().__init__()
         assert architecture in ['orig', 'skip']
 
         self.return_dlatents = return_dlatents
+        self.num_channels = num_channels
 
         self.g_mapping = G_mapping(mapping_fmaps=mapping_fmaps,
                                    dlatent_size=dlatent_size,
@@ -1086,14 +964,33 @@ class G_stylegan2(nn.Module):
                                                  act=act,
                                                  opts=opts)
 
+        self.truncation_cutoff = truncation_cutoff
+        self.truncation_psi = truncation_psi
+
     def forward(self, x):
-        dlatent = self.g_mapping(x)
-        x = self.g_synthesis(dlatent)
+        dlatents1 = self.g_mapping(x)
+        num_layers = dlatents1.shape[1]
+
+        # Apply truncation trick.
+        if self.truncation_psi and self.truncation_cutoff:
+            coefs = np.ones([1, num_layers, 1], dtype=np.float32)
+            for i in range(num_layers):
+                if i < self.truncation_cutoff:
+                    coefs[:, i, :] *= self.truncation_psi
+            """Linear interpolation.
+               a + (b - a) * t (a = 0)
+               reduce to
+               b * t
+            """
+
+            dlatents1 = dlatents1 * torch.Tensor(coefs).to(dlatents1.device)
+
+        out = self.g_synthesis(dlatents1)
 
         if self.return_dlatents:
-            return x, dlatent
+            return out, dlatents1
         else:
-            return x
+            return out
 
 
 # =========================================================================
@@ -1126,7 +1023,7 @@ class D_stylegan2(nn.Module):
         """
         super().__init__()
         self.resolution_log2 = int(np.log2(resolution))
-        assert resolution == 2 ** self.resolution_log2 and resolution >= 4
+        assert resolution == 2 ** self.resolution_log2 and resolution >= 4 and self.resolution_log2 >= 4
         self.nf = lambda stage: np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
         # fromrgb: fixed mode
         self.fromrgb = Conv2d(num_channels, self.nf(self.resolution_log2 - 1), kernel_size=1)
@@ -1145,15 +1042,16 @@ class D_stylegan2(nn.Module):
                                output_channels=self.nf(self.resolution_log2 - 1),
                                use_wscale=True)
 
-        self.dblock10 = DBlock(in1=self.nf(9), in2=self.nf(9), out3=self.nf(8), resample_kernel=resample_kernel)
-        self.dblock9 = DBlock(in1=self.nf(8), in2=self.nf(8), out3=self.nf(7), resample_kernel=resample_kernel)
-        self.dblock8 = DBlock(in1=self.nf(7), in2=self.nf(7), out3=self.nf(6), resample_kernel=resample_kernel)
-        self.dblock7 = DBlock(in1=self.nf(6), in2=self.nf(6), out3=self.nf(5), resample_kernel=resample_kernel)
-        self.dblock6 = DBlock(in1=self.nf(5), in2=self.nf(5), out3=self.nf(4), resample_kernel=resample_kernel)
-        self.dblock5 = DBlock(in1=self.nf(4), in2=self.nf(4), out3=self.nf(3), resample_kernel=resample_kernel)
-        self.dblock4 = DBlock(in1=self.nf(4), in2=self.nf(3), out3=self.nf(2), resample_kernel=resample_kernel)
-        self.dblock3 = DBlock(in1=self.nf(3), in2=self.nf(2), out3=self.nf(1), resample_kernel=resample_kernel)
-        self.dblock2 = DBlock(in1=self.nf(2), in2=self.nf(1), out3=self.nf(0), resample_kernel=resample_kernel)
+        # dblock layers
+        self.block_layers = ModuleList([])
+
+        for res in range(self.resolution_log2, 4, -1):
+            self.block_layers.append(DBlock(in1=self.nf(res - 1), in2=self.nf(res - 1), out3=self.nf(res - 2),
+                                            resample_kernel=resample_kernel))
+
+        for res in range(4, 2, -1):
+            self.block_layers.append(
+                DBlock(in1=self.nf(res), in2=self.nf(res - 1), out3=self.nf(res - 2), resample_kernel=resample_kernel))
 
         # 4x4
         self.minibatch_stddev = Minibatch_stddev_layer(mbstd_group_size, mbstd_num_features)
@@ -1172,8 +1070,8 @@ class D_stylegan2(nn.Module):
         y = input
         # 1) Main Layers.
         x = self.fromrgb([x_origin, y])
-        for res in range(self.resolution_log2, 2, -1):
-            x = getattr(self, 'dblock{}'.format(res))(x)
+        for dblock in self.block_layers:
+            x = dblock(x)
 
         # 2) Final layers (4 x 4).
         if self.mbstd_group_size > 1:
@@ -1191,8 +1089,214 @@ class D_stylegan2(nn.Module):
         if self.label_size == 0:
             out = self.fc_last2(out)
             return out
+
+# =========================================================================
+#   Define StyleGAN2
+# =========================================================================
+
+class StyleGAN2:
+    """ Unconditional StyleGAN2
+    """
+
+    def __init__(self,
+                 opts,
+                 use_ema=True,
+                 ema_decay=0.999):
+        """ constructor for the class """
+
+        self.start_epoch = 0
+        self.opts = opts
+        # Create the model
+        self.G = G_stylegan2(opts=opts,
+                             fmap_base=opts.fmap_base,
+                             resolution=opts.resolution,
+                             mapping_layers=opts.mapping_layers,
+                             return_dlatents=opts.return_latents,
+                             architecture='skip')
+
+        self.D = D_stylegan2(fmap_base=opts.fmap_base,
+                             resolution=opts.resolution,
+                             structure='resnet')
+
+        # Load the pre-trained weight
+        if os.path.exists(opts.resume):
+            INFO("Load the pre-trained weight!")
+            state = torch.load(opts.resume)
+            self.G.load_state_dict(state['G'])
+            self.D.load_state_dict(state['D'])
+            self.start_epoch = state['start_epoch']
         else:
-            raise Exception("Sorry, multi-label unsupported right now.")
+            INFO("Pre-trained weight cannot load successfully, train from scratch!")
+
+        # Multi-GPU support
+        if torch.cuda.device_count() > 1:
+            INFO("Multiple GPU:" + str(torch.cuda.device_count()) + "\t GPUs")
+            self.G = torch.nn.DataParallel(self.G)
+            self.D = torch.nn.DataParallel(self.D)
+        self.G.to(opts.device)
+        self.D.to(opts.device)
+
+        # state of the object
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+
+        if self.use_ema:
+            from utils.libs import update_average
+
+            # create a shadow copy of the generator
+            self.Gs = copy.deepcopy(self.G)
+
+            # updater function:
+            self.ema_updater = update_average
+
+            # initialize the gen_shadow weights equal to the
+            # weights of gen
+            Gs_beta = 0.99
+            self.ema_updater(self.Gs, self.G, beta=Gs_beta)
+
+        # by default the generator and discriminator are in eval mode
+        self.G.eval()
+        self.D.eval()
+        if self.use_ema:
+            self.Gs.eval()
+
+    def optimize_G(self,
+                   gen_optim,
+                   dlatent,
+                   real_batch,
+                   loss_fn):
+        """
+               performs one step of weight update on generator using the batch of data
+               :param gen_optim: generator optimizer
+               :param dlatent: input noise of sample generation
+               :param real_batch: real samples batch
+                                  should contain a list of tensors at different scales
+               :param loss_fn: loss function to be used (object of GANLoss)
+               :return: current loss
+        """
+
+        # generate a batch of samples
+        fake_samples = self.G(dlatent)
+        loss = loss_fn.gen_loss(real_batch, fake_samples)
+
+        # optimize discriminator
+        gen_optim.zero_grad()
+        loss.backward()
+        gen_optim.step()
+
+        # if self.use_ema is true, apply the moving average here:
+        if self.use_ema:
+            self.ema_updater(self.Gs, self.G, self.ema_decay)
+
+        return loss.mean().item()
+
+    def optimize_D(self,
+                   dis_optim,
+                   dlatent,
+                   real_batch,
+                   loss_fn):
+        """
+        performs one step of weight update on discriminator using the batch of data
+        :param dis_optim: discriminator optimizer
+        :param dlatent: input noise of sample generation
+        :param real_batch: real samples batch
+                           should contain a list of tensors at different scales
+        :param loss_fn: loss function to be used (object of GANLoss)
+        :return: current loss
+        """
+        # generate a batch of samples
+        fake_samples = self.G(dlatent)
+        fake_samples = fake_samples.detach()
+
+        loss = loss_fn.dis_loss(real_batch, fake_samples)
+
+        # optimize discriminator
+        dis_optim.zero_grad()
+        loss.backward()
+        dis_optim.step()
+
+        return loss.mean().item()
+
+    def train(self,
+              data_loader,
+              gen_optim,
+              dis_optim,
+              loss_fn,
+              scheduler_gen,
+              scheduler_dis
+              ):
+        """
+           Method for training the network
+           1) data_loader.    Dataloader in PyTorch.
+           2) gen_optim.      torch.optim.Optimizer for Generator.
+           3) dis_optim.      torch.optim.Optimizer for Discriminator.
+           4) loss_fn.        loss/ganloss.py StyleLoss.
+           5) scheduler_gen.  scheduler_gen.
+           6) scheduler_dis.  scheduler_dis.
+        """
+
+        # turn the generator and discriminator into train mode
+        self.G.train()
+        self.D.train()
+
+        # Train
+        fix_z = torch.randn([self.opts.batch_size, 512]).to(self.opts.device)
+        softplus = torch.nn.Softplus()
+        Loss_D_list = [0.0]
+        Loss_G_list = [0.0]
+        for ep in range(self.start_epoch, self.opts.epoch):
+            bar = tqdm(data_loader)
+            loss_D_list = []
+            loss_G_list = []
+            for i, (real_img,) in enumerate(bar):
+                real_img = real_img.to(self.opts.device)
+                latents = torch.randn([real_img.size(0), 512]).to(self.opts.device)
+
+                # optimize the discriminator:
+                d_loss = self.optimize_D(dis_optim, latents,
+                                         real_img, loss_fn)
+
+                # optimize the generator:
+                g_loss = self.optimize_G(gen_optim, latents,
+                                         real_img, loss_fn)
+
+                loss_G_list.append(g_loss)
+                loss_D_list.append(d_loss)
+
+                # Output training stats
+                bar.set_description(
+                    "Epoch {} [{}, {}] [G]: {} [D]: {}".
+                        format(ep, i + 1, len(data_loader), loss_G_list[-1], loss_D_list[-1]))
+
+            # Save the result
+            Loss_G_list.append(np.mean(loss_G_list))
+            Loss_D_list.append(np.mean(loss_D_list))
+
+            # Check how the generator is doing by saving G's output on fixed_noise
+            with torch.no_grad():
+                if self.opts.return_latents:
+                    fake_img = self.G(fix_z)[0].detach().cpu()
+                else:
+                    fake_img = self.G(fix_z).detach().cpu()
+                save_image(fake_img, os.path.join(self.opts.det, 'images', str(ep) + '.png'), nrow=4, normalize=True)
+
+            # Save model
+            state = {
+                'G': self.G.state_dict(),
+                'D': self.D.state_dict(),
+                'Loss_G': Loss_G_list,
+                'Loss_D': Loss_D_list,
+                'start_epoch': ep,
+            }
+            torch.save(state, os.path.join(self.opts.det, 'models', 'latest.pth'))
+
+            scheduler_gen.step()
+            scheduler_dis.step()
+
+        # Plot the total loss curve
+        Loss_D_list = Loss_D_list[1:]
+        Loss_G_list = Loss_G_list[1:]
+        plotLossCurve(self.opts, Loss_D_list, Loss_G_list)
 
 
 if __name__ == "__main__":
