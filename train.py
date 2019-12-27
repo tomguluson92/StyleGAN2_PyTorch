@@ -140,23 +140,11 @@ def main(opts):
             fake_scores_out = D(fake_img)
             _g_loss = softplus(-fake_scores_out)
 
-            # Compute |J*y|.
-            # pl_noise = (torch.randn(fake_img.shape) / np.sqrt(fake_img.shape[2] * fake_img.shape[3])).to(fake_img.device)
-            # pl_grads = grad(torch.sum(fake_img * pl_noise), fake_dlatent, retain_graph=True)[0]
-            # pl_lengths = torch.sqrt(torch.sum(torch.sum(torch.mul(pl_grads, pl_grads), dim=2), dim=1))
-            # pl_mean = PL_DECAY * torch.sum(pl_lengths)
-            #
-            # pl_penalty = torch.mul(pl_lengths - pl_mean, pl_lengths - pl_mean)
-            # reg = pl_penalty * PL_WEIGHT
-            #
-            # # original
-            # g_loss = (_g_loss + reg).mean()
-            # lite
             g_loss = _g_loss.mean()
             loss_G_list.append(g_loss.mean().item())
 
             # Update generator
-            g_loss.backward(retain_graph=True)
+            g_loss.backward()
             optim_G.step()
 
             # Output training stats

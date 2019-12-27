@@ -12,8 +12,6 @@ This repository contains a PyTorch implementation of the following paper:
 > Paper: http://arxiv.org/abs/1912.04958
 > Video: https://youtu.be/c-NJtV9Jvp0
 
-![Teaser image](utils/stylegan-teaser.png)
-Picture: These people are not real – they were produced by our generator that allows control over different aspects of the image.
 
 ## Motivation
 To the best of my knowledge, there is still not a similar pytorch 1.0 implementation of styleGAN2 as NvLabs released(Tensorflow),
@@ -23,7 +21,16 @@ therefore, i wanna implement it on pytorch1.0.1 to extend its usage in pytorch c
 @date: 2019.12.16
 
 @info: settings are in opts/opts.py. you can change to your own dataset and choose resolution at 64, 128, 256 and so on.
- 
+
+@date: 2019.12.27
+
+@info: **Need Help!** 
+       \
+       After about 2 weeks experiment, this version is still hard to converge. I am pretty confident about
+       my G&D definition are strictly follow the same with the originial [stylegan2](https://github.com/NVlabs/stylegan2).
+       So if you are willing to make this project converge, please feel free to change it! 
+       **Especially in training paradigm!** 
+       
 ## Author
 
 - [Samuel Ko](https://blog.csdn.net/g11d111)
@@ -43,8 +50,6 @@ python3 train.py
 > we follow the release code of styleGAN2 carefully and if you found any bug or mistake in implementation,
 > please tell us and improve it, thank u very much! .
 
-#### Unfinished
-* Inference code.
 
 ## Related
 [1. StyleGAN - Official TensorFlow Implementation](https://github.com/NVlabs/stylegan)
