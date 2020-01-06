@@ -19,6 +19,11 @@
     @date:   2019.12.20
 
     @update: 1) split ModulatedConv2d into 2 part.
+
+    @date:   2020.01.02
+
+    @update: 1) refact initialization part.
+    @ref:    https://stackoverflow.com/questions/51136581/how-to-create-a-normal-distribution-in-pytorch
 """
 
 import os
@@ -38,9 +43,10 @@ from torchvision.utils import save_image
 from matplotlib import pyplot as plt
 from utils.utils import plotLossCurve
 
-from utils.libs import ShrinkFun
 
-shrink_fun = ShrinkFun.apply
+# from utils.libs import ShrinkFun
+
+# shrink_fun = ShrinkFun.apply
 
 
 # =========================================================================
@@ -75,7 +81,6 @@ class BiasAdd(nn.Module):
         super(BiasAdd, self).__init__()
 
         self.opts = opts
-        # fixme: 就是因为self.bias是nn.Parameter的情况, 才导致必须使用retain_graph=True!
         self.bias = torch.nn.Parameter((torch.zeros(channels, 1, 1) * lrmul))
 
         self.act = act
@@ -114,7 +119,7 @@ class FC(nn.Module):
             The complete conversion of Dense/FC/Linear Layer of original Tensorflow version.
         """
         super(FC, self).__init__()
-        he_std = gain / ((in_channels * out_channels) ** (0.5))  # He init
+        he_std = gain / np.sqrt((in_channels * out_channels))  # He init
         if use_wscale:
             init_std = 1.0 / lrmul
             self.w_lrmul = he_std * lrmul
@@ -122,7 +127,7 @@ class FC(nn.Module):
             init_std = he_std / lrmul
             self.w_lrmul = lrmul
 
-        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels) * init_std)
+        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels).normal_(0, init_std))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(out_channels))
             self.b_lrmul = lrmul
@@ -136,7 +141,10 @@ class FC(nn.Module):
         if self.bias is not None and self.mode != 'modulate':
             out = F.linear(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul)
         elif self.bias is not None and self.mode == 'modulate':
-            out = F.linear(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul) + 1
+            # original
+            # out = F.linear(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul) + 1
+            # re-implement
+            out = F.linear(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul)
         else:
             out = F.linear(x, self.weight * self.w_lrmul)
 
@@ -156,14 +164,17 @@ class Conv2d(nn.Module):
                  output_channels,
                  kernel_size,
                  gain=1,
-                 use_wscale=False,
+                 use_wscale=True,
                  lrmul=1,
-                 bias=True):
+                 bias=True,
+                 act='linear'):
         super().__init__()
 
         assert kernel_size >= 1 and kernel_size % 2 == 1
-        he_std = gain / ((input_channels * output_channels * kernel_size * kernel_size) ** (0.5))  # He init
+        he_std = gain / np.sqrt((input_channels * output_channels * kernel_size * kernel_size))  # He init
         self.kernel_size = kernel_size
+        self.act = act
+
         if use_wscale:
             init_std = 1.0 / lrmul
             self.w_lrmul = he_std * lrmul
@@ -171,8 +182,7 @@ class Conv2d(nn.Module):
             init_std = he_std / lrmul
             self.w_lrmul = lrmul
 
-        self.weight = torch.nn.Parameter(
-            torch.randn(output_channels, input_channels, kernel_size, kernel_size) * init_std)
+        self.weight = torch.nn.Parameter(torch.empty(output_channels, input_channels, kernel_size, kernel_size).normal_(0, init_std))
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(output_channels))
             self.b_lrmul = lrmul
@@ -181,9 +191,16 @@ class Conv2d(nn.Module):
 
     def forward(self, x):
         if self.bias is not None:
-            return F.conv2d(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul, padding=self.kernel_size // 2)
+            out = F.conv2d(x, self.weight * self.w_lrmul, self.bias * self.b_lrmul, padding=self.kernel_size // 2)
         else:
-            return F.conv2d(x, self.weight * self.w_lrmul, padding=self.kernel_size // 2)
+            out = F.conv2d(x, self.weight * self.w_lrmul, padding=self.kernel_size // 2)
+
+        if self.act == 'lrelu':
+            out = F.leaky_relu(out, 0.2, inplace=True)
+            out = out * np.sqrt(2)  # original repo def_gain=np.sqrt(2).
+            return out
+        elif self.act == 'linear':
+            return out
 
 
 class FromRGB(nn.Module):
@@ -239,7 +256,7 @@ class ModulatedConv2d(nn.Module):
                            output_channels=output_channels,
                            kernel_size=1, use_wscale=use_wscale, lrmul=lrmul)
 
-        he_std = gain / ((input_channels * output_channels * kernel_size * kernel_size) ** (0.5))  # He init
+        he_std = gain / np.sqrt((input_channels * output_channels * kernel_size * kernel_size))  # He init
         self.kernel_size = kernel_size
         if use_wscale:
             init_std = 1.0 / lrmul
@@ -248,18 +265,18 @@ class ModulatedConv2d(nn.Module):
             init_std = he_std / lrmul
             self.w_lrmul = lrmul
 
-        self.w = torch.nn.Parameter(
-            torch.randn(output_channels, input_channels, kernel_size, kernel_size) * init_std)
+        self.w = torch.nn.Parameter(torch.empty(output_channels, input_channels, kernel_size, kernel_size).normal_(0, init_std))
         self.convH, self.convW = self.w.shape[2:]
 
-        self.dense = FC(dlatent_size, input_channels, gain, lrmul=lrmul, use_wscale=use_wscale, mode='modulate')
+        self.dense = FC(dlatent_size, input_channels, gain, lrmul=lrmul, use_wscale=use_wscale, mode='modulate',
+                        act='linear')
 
         if self.up:
             factor = 2
             self.k = _setup_kernel(k) * (gain * (factor ** 2))  # 4 x 4
             self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
             self.k = torch.flip(self.k, [2, 3])
-            self.k = nn.Parameter(self.k, requires_grad=False)
+            self.k = torch.nn.Parameter(self.k, requires_grad=False)
 
             self.p = self.k.shape[0] - factor - (kernel_size - 1)
 
@@ -279,20 +296,18 @@ class ModulatedConv2d(nn.Module):
         # Modulate.
         s = self.dense(y)  # [BI] Transform incoming W to style.
 
-        # BOIkk ---> BkkOI  ---> BkkIO
-        self.ww = self.w.unsqueeze(0)
+        # OIkk ---> BkkOI  ---> BkkIO
+        self.ww = (self.w * self.w_lrmul).unsqueeze(0)
         self.ww = self.ww.repeat(s.shape[0], 1, 1, 1, 1)
         self.ww = self.ww.permute(0, 3, 4, 1, 2)
-        # self.ww = self.ww * s.unsqueeze(1).unsqueeze(1).unsqueeze(1).to(
-        #     self.opts.device)  # [BkkOI] Scale input feature maps.
         self.ww = self.ww * s.unsqueeze(1).unsqueeze(1).unsqueeze(1)  # [BkkOI] Scale input feature maps.
         self.ww = self.ww.permute(0, 1, 2, 4, 3)  # [BkkIO]
 
         # Demodulate.
         if self.demodulate:
             d = torch.mul(self.ww, self.ww)
-            d = torch.rsqrt(torch.mean(d, dim=[1, 2, 3]) + 1e-8)  # [BO] Scaling factor.
-            self.ww = self.ww * d.unsqueeze(1).unsqueeze(1).unsqueeze(1)  # [BkkIO] Scale output feature maps.
+            d = torch.rsqrt(torch.sum(d, dim=[1, 2, 3]) + 1e-8)  # [BO] Scaling factor.
+            self.ww = self.ww * (d.unsqueeze(1).unsqueeze(1).unsqueeze(1))  # [BkkIO] Scale output feature maps.
 
         # Reshape/scale input.
         if self.fused_modconv:
@@ -300,15 +315,21 @@ class ModulatedConv2d(nn.Module):
             self.w_new = torch.reshape(self.ww.permute(0, 4, 3, 1, 2),
                                        (-1, x.shape[1], self.ww.shape[1], self.ww.shape[2]))
         else:
-            # x = x * s.unsqueeze(-1).unsqueeze(-1).to(self.opts.device)  # [BIhw] Not fused => scale input activations.
-            x = x * s.unsqueeze(-1).unsqueeze(-1)  # [BIhw] Not fused => scale input activations.
-            self.w_new = self.w.unsqueeze(0).repeat(s.shape[0], 1, 1, 1, 1)
+            x = x * (s.unsqueeze(-1).unsqueeze(-1))  # [BIhw] Not fused => scale input activations.
+            self.w_new = self.w * self.w_lrmul
 
         # Convolution with optional up/downsampling.
         if self.up:
-            inC, outC, convH, convW = self.w_new.shape[0], self.w_new.shape[1], self.w_new.shape[2], self.w_new.shape[3]
-            self.w_new = self.w_new.reshape(outC, inC, convH, convW)
-            x = F.conv_transpose2d(x.contiguous(), self.w_new, stride=2)
+            outC, inC, convH, convW = self.w_new.shape[0], self.w_new.shape[1], self.w_new.shape[2], self.w_new.shape[3]
+
+            # Transpose Weight
+            num_groups = x.shape[1] // inC if (x.shape[1] // inC) >= 1 else 1
+            self.w_new = self.w_new.reshape(-1, num_groups, inC, convH, convW)
+            self.w_new = self.w_new.flip([3, 4])
+            self.w_new = self.w_new.permute(2, 1, 0, 3, 4)
+            self.w_new = self.w_new.reshape(inC, outC, convH, convW)
+
+            x = F.conv_transpose2d(x, self.w_new, stride=2)
 
             # step 2: upfirdn2d
             y = x.clone()
@@ -316,7 +337,7 @@ class ModulatedConv2d(nn.Module):
 
             inC, inH, inW = x.shape[1:]
             # 1) Upsample
-            y = torch.reshape(y, (-1, inH, inW, 1))
+            y = y.reshape(-1, inH, inW, 1)
 
             # 2) Pad (crop if negative).
             y = F.pad(y, (0, 0,
@@ -332,7 +353,6 @@ class ModulatedConv2d(nn.Module):
             # 3) Convolve with filter.
             y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
             y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
-            # self.k = torch.flip(self.k, [2, 3]).to(self.opts.device)
             y = F.conv2d(y, self.k)
             y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
                        inW + self.padx0 + self.padx1 - self.kernelW + 1)
@@ -340,7 +360,7 @@ class ModulatedConv2d(nn.Module):
             # 4) Downsample (throw away pixels).
             if inH != y.shape[1] or inH % 2 != 0:
                 inH = inW = _approximate_size(inH)
-                y = F.interpolate(y, size=(inH, inW))
+                y = F.interpolate(y, size=(inH, inW), mode='bilinear')
             y = y.permute(0, 2, 3, 1)
             x = y.reshape(-1, inC, inH, inW)
 
@@ -348,13 +368,13 @@ class ModulatedConv2d(nn.Module):
             pass
         else:
             x = F.conv2d(x,
-                         self.w_new * self.w_lrmul,
+                         self.w_new,
                          padding=self.w_new.shape[2] // 2)
         # Reshape/scale output.
         if self.fused_modconv:
-            x = x.contiguous().view(-1, self.fmaps, x.shape[2], x.shape[3])  # Fused => reshape convolution groups back to minibatch.
+            x = x.reshape(-1, self.fmaps, x.shape[2], x.shape[3])  # Fused => reshape convolution groups back to minibatch.
         elif self.demodulate:
-            x = x * d.unsqueeze(1).unsqueeze(1)  # [BOhw] Not fused => scale output activations.
+            x = x * d.unsqueeze(-1).unsqueeze(-1)                  # [BOhw] Not fused => scale output activations.
 
         return x
 
@@ -379,16 +399,16 @@ class ToRGB(nn.Module):
         self.modulated_conv2d = ModulatedConv2d(input_channels=input_channels,
                                                 output_channels=output_channels,
                                                 kernel_size=1,
+                                                up=False,
                                                 use_wscale=use_wscale,
                                                 lrmul=lrmul,
                                                 gain=gain,
                                                 demodulate=False,
                                                 fused_modconv=fused_modconv,
                                                 opts=opts)
-        # fixme: 2019.12.26 防止reuse? https://discuss.pytorch.org/t/stylegan2-retain-graph-false-runtimeerror/64883/6
-        # self.biasAdd = BiasAdd(opts=opts,
-        #                        act='linear',
-        #                        channels=output_channels)
+        self.biasAdd = BiasAdd(opts=opts,
+                               act='linear',
+                               channels=output_channels)
 
         self.res = res
         self.opts = opts
@@ -398,12 +418,9 @@ class ToRGB(nn.Module):
         dlatent = dlatent[:, self.res * 2 - 3]
 
         x = self.modulated_conv2d([x, dlatent])
-        # x = self.biasAdd(x)
+        t = self.biasAdd(x)
 
-        if y is None:
-            return x
-        else:
-            return x + y
+        return t if y is None else y + t
 
 
 class GLayer(nn.Module):
@@ -489,7 +506,6 @@ class Upsample2d(nn.Module):
         self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
         self.k = torch.flip(self.k, [2, 3])
         self.k = nn.Parameter(self.k, requires_grad=False)
-        # self.k = nn.Parameter(self.k)
 
         self.p = self.k.shape[0] - self.factor
 
@@ -518,9 +534,9 @@ class Upsample2d(nn.Module):
                       0, 0
                       ))
         y = y[:,
-              max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
-              max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
-              :]
+            max(-self.pady0, 0): y.shape[1] - max(-self.pady1, 0),
+            max(-self.padx0, 0): y.shape[2] - max(-self.padx1, 0),
+            :]
 
         # 3) Convolve with filter.
         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
@@ -532,7 +548,7 @@ class Upsample2d(nn.Module):
 
         # 4) Downsample (throw away pixels).
         if inH * self.factor != y.shape[1]:
-            y = F.interpolate(y, size=(inH * self.factor, inW * self.factor))
+            y = F.interpolate(y, size=(inH * self.factor, inW * self.factor), mode='bilinear')
         y = y.permute(0, 2, 3, 1)
         y = y.reshape(-1, inC, inH * self.factor, inW * self.factor)
 
@@ -549,7 +565,8 @@ class ConvDownsample2d(nn.Module):
                  gain=1,
                  use_wscale=True,
                  lrmul=1,
-                 bias=True):
+                 bias=False,
+                 act='linear'):
         """
             ConvDownsample2D method in D_stylegan2.
         :param k: FIR filter of the shape `[firH, firW]` or `[firN]` (separable).
@@ -563,7 +580,7 @@ class ConvDownsample2d(nn.Module):
         assert isinstance(factor, int) and factor >= 1, "factor must be larger than 1! (default: 2)"
         assert kernel_size >= 1 and kernel_size % 2 == 1
 
-        he_std = gain / ((input_channels * output_channels * kernel_size * kernel_size) ** (0.5))  # He init
+        he_std = gain / np.sqrt((input_channels * output_channels * kernel_size * kernel_size))  # He init
         self.kernel_size = kernel_size
         if use_wscale:
             init_std = 1.0 / lrmul
@@ -573,8 +590,7 @@ class ConvDownsample2d(nn.Module):
             self.w_lrmul = lrmul
 
         # https://discuss.pytorch.org/t/gaussian-distribution/35031
-        self.weight = torch.nn.Parameter(
-            torch.randn(output_channels, input_channels, kernel_size, kernel_size) * init_std)
+        self.weight = torch.nn.Parameter(torch.empty(output_channels, input_channels, kernel_size, kernel_size).normal_(0, init_std))
         self.convH, self.convW = self.weight.shape[2:]
 
         if bias:
@@ -585,12 +601,12 @@ class ConvDownsample2d(nn.Module):
 
         self.gain = gain
         self.factor = factor
+        self.act = act
 
         self.k = _setup_kernel(k) * self.gain  # 3 x 3. (original 4 x 4).
         self.k = torch.FloatTensor(self.k).unsqueeze(0).unsqueeze(0)
         self.k = torch.flip(self.k, [2, 3])
         self.k = nn.Parameter(self.k, requires_grad=False)
-        # self.k = nn.Parameter(self.k)
 
         self.p = (self.k.shape[-1] - self.factor) + (self.convW - 1)
 
@@ -623,28 +639,34 @@ class ConvDownsample2d(nn.Module):
         # 3) Convolve with filter.
         y = y.permute(0, 3, 1, 2)  # N*C H W 1 --> N*C 1 H W
         y = y.reshape(-1, 1, inH + self.pady0 + self.pady1, inW + self.padx0 + self.padx1)
-        # x1 = F.conv2d(x1, self.k, padding=self.kernelH // 2)
-
-        # self.k = torch.flip(self.k, [2, 3]).to("cuda")
         y = F.conv2d(y, self.k)
         y = y.view(-1, 1, inH + self.pady0 + self.pady1 - self.kernelH + 1,
                    inW + self.padx0 + self.padx1 - self.kernelW + 1)
 
         # 4) Downsample (throw away pixels).
         if inH != y.shape[1]:
-            y = F.interpolate(y, size=(inH, inW))
+            y = F.interpolate(y, size=(inH, inW), mode='bilinear')
         y = y.permute(0, 2, 3, 1)
         y = y.reshape(-1, inC, inH, inW)
 
         # step 2: downsample (in general, stride = self.factor = 2)
-        x1 = F.conv2d(y,
-                      self.weight * self.w_lrmul,
-                      self.bias * self.b_lrmul,
-                      stride=self.factor,
-                      padding=self.convW // 2)
+        if self.bias is not None:
+            x1 = F.conv2d(y,
+                          self.weight * self.w_lrmul,
+                          self.bias * self.b_lrmul,
+                          stride=self.factor,
+                          padding=self.convW // 2)
+        else:
+            x1 = F.conv2d(y,
+                          self.weight * self.w_lrmul,
+                          stride=self.factor,
+                          padding=self.convW // 2)
         # step 3: non-linearity.
-        out = F.leaky_relu(x1, 0.2, inplace=True)
-        out = out * np.sqrt(2)  # original repo def_gain=np.sqrt(2).
+        if self.act == 'lrelu':
+            out = F.leaky_relu(x1, 0.2, inplace=True)
+            out = out * np.sqrt(2)  # original repo def_gain=np.sqrt(2).
+        else:
+            out = x1
 
         return out
 
@@ -709,18 +731,24 @@ class DBlock(nn.Module):
 
         self.conv0 = Conv2d(input_channels=in1,
                             output_channels=in2,
-                            kernel_size=3, use_wscale=use_wscale, lrmul=lrmul,
-                            bias=True)
+                            kernel_size=3,
+                            use_wscale=use_wscale,
+                            lrmul=lrmul,
+                            bias=True,
+                            act='lrelu')
 
         self.conv1_down = ConvDownsample2d(kernel_size=3,
                                            input_channels=in2,
                                            output_channels=out3,
-                                           k=resample_kernel)
+                                           k=resample_kernel,
+                                           bias=True,
+                                           act='lrelu')
 
         self.res_conv2_down = ConvDownsample2d(kernel_size=1,
                                                input_channels=in1,
                                                output_channels=out3,
-                                               k=resample_kernel)
+                                               k=resample_kernel,
+                                               bias=False)
 
     def forward(self, x):
         t = x.clone()
@@ -831,7 +859,7 @@ class G_synthesis_stylegan2(nn.Module):
                  fmap_max=512,  # Maximum number of feature maps in any layer.
                  architecture='skip',  # Architecture: 'orig', 'skip', 'resnet'.
                  use_wscale=True,  # Enable equalized learning rate?
-                 lrmul=0.01,  # Learning rate multiplier for the mapping layers.
+                 lrmul=1,  # Learning rate multiplier for the mapping layers.
                  gain=1,  # original gain in tensorflow.
                  act='lrelu',  # Activation function: 'linear', 'lrelu'.
                  resample_kernel=[1, 3, 3, 1],
@@ -852,7 +880,7 @@ class G_synthesis_stylegan2(nn.Module):
         self.opts = opts
 
         # Primary inputs.
-        self.x = nn.Parameter(torch.randn(1, self.nf(1), 4, 4))
+        self.x = torch.nn.Parameter(torch.randn(1, self.nf(1), 4, 4))
         # self.x = torch.randn(1, self.nf(1), 4, 4).to(self.opts.device)
 
         # layer0
@@ -906,7 +934,6 @@ class G_synthesis_stylegan2(nn.Module):
             y = self.rgb0([x, y, dlatent])
 
         # Main layers.
-        # for res in range(3, self.resolution_log2 + 1):
         for res, (rgb, block) in enumerate(zip(self.rgb_layers, self.block_layers)):
             x = block([x, dlatent])
             if self.arch == 'skip':
@@ -978,17 +1005,14 @@ class G_stylegan2(nn.Module):
 
         # Apply truncation trick.
         if self.truncation_psi and self.truncation_cutoff:
+            batch_avg = torch.mean(dlatents1, dim=1, keepdim=True)
             coefs = np.ones([1, num_layers, 1], dtype=np.float32)
             for i in range(num_layers):
-                if i < self.truncation_cutoff:
-                    coefs[:, i, :] *= self.truncation_psi
+                coefs[:, i, :] *= self.truncation_psi
             """Linear interpolation.
-               a + (b - a) * t (a = 0)
-               reduce to
-               b * t
+               a + (b - a) * t
             """
-
-            dlatents1 = dlatents1 * torch.Tensor(coefs).to(dlatents1.device)
+            dlatents1 = batch_avg + (dlatents1 - batch_avg) * torch.Tensor(coefs).to(dlatents1.device)
 
         out = self.g_synthesis(dlatents1)
 
@@ -1030,8 +1054,6 @@ class D_stylegan2(nn.Module):
         self.resolution_log2 = int(np.log2(resolution))
         assert resolution == 2 ** self.resolution_log2 and resolution >= 4 and self.resolution_log2 >= 4
         self.nf = lambda stage: np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max)
-        # fromrgb: fixed mode
-        self.fromrgb = Conv2d(num_channels, self.nf(self.resolution_log2 - 1), kernel_size=1)
 
         assert structure in ['orig', 'skip', 'resnet']
 
@@ -1062,9 +1084,11 @@ class D_stylegan2(nn.Module):
         self.minibatch_stddev = Minibatch_stddev_layer(mbstd_group_size, mbstd_num_features)
         self.conv_last = Conv2d(input_channels=self.nf(2) + mbstd_num_features,
                                 output_channels=self.nf(1),
-                                kernel_size=3)
+                                kernel_size=3,
+                                act='lrelu')
         self.fc_last1 = FC(in_channels=fmap_base,
-                           out_channels=self.nf(0))
+                           out_channels=self.nf(0),
+                           act='lrelu')
         self.fc_last2 = FC(in_channels=self.nf(0),
                            out_channels=1,
                            act='linear')
@@ -1083,20 +1107,18 @@ class D_stylegan2(nn.Module):
             x = self.minibatch_stddev(x)
         x = self.conv_last(x)
 
-        out = F.leaky_relu(x, 0.2, inplace=True)
-        out = out * np.sqrt(2)
+        out = x
 
         _, c, h, w = out.shape
         out = out.view(-1, h * w * c)
 
-        # 注册梯度.
-        # out.register_hook(lambda g: print("D out梯度", g))
         out = self.fc_last1(out)
 
         # 3) Output
         if self.label_size == 0:
             out = self.fc_last2(out)
             return out
+
 
 # =========================================================================
 #   Define StyleGAN2

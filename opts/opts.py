@@ -26,7 +26,6 @@ def presentParameters(args_dict):
 class TrainOptions():
     def __init__(self):
         parser = argparse.ArgumentParser()
-        # parser.add_argument('--path', type=str, default='./star/')
         parser.add_argument('--path', type=str, default='/home/samuel/gaodaiheng/生成模型/face_dataset/')
         parser.add_argument('--epoch', type=int, default=500)
         parser.add_argument('--fmap_base', type=int, default=8 << 10)
